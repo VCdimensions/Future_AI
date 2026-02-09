@@ -41,16 +41,7 @@ CNYES_SEARCH_ENERGY = "https://www.cnyes.com/search/all?keyword=%E8%83%BD%E6%BA%
 CNYES_SEARCH_METALS = "https://www.cnyes.com/search/all?keyword=%E8%B2%B4%E9%87%91%E5%B1%AC%E7%9B%A4%E5%BE%8C"
 
 SOURCES: List[SourceSpec] = [
-    # 1) UDN 6644 最新文章 + 財經焦點
-    SourceSpec(
-        key="udn_6644_latest",
-        name="UDN 產經 6644｜最新文章（挑 2 則：影響台股最重要）",
-        url=UDN_6644,
-        mode="udn_html",
-        start_heading=None,
-        stop_heading="財經焦點",
-        pick_rule="tw_impact",
-    ),
+    # 1) UDN 6644 財經焦點
     SourceSpec(
         key="udn_6644_focus",
         name="UDN 產經 6644｜財經焦點（挑 2 則：影響台股最重要）",
@@ -125,7 +116,6 @@ SOURCES: List[SourceSpec] = [
 ]
 
 SOURCES_UI_ORDER = [
-    "udn_6644_latest",
     "udn_6644_focus",
     "udn_6645_market",
     "udn_6645_elec",
@@ -247,16 +237,24 @@ KW = {
 }
 
 
-def build_gpt_pick_prompt(spec: SourceSpec, items: List[Dict[str, str]], top_n: int) -> Tuple[str, str]:
+def build_gpt_pick_prompt(
+    spec: SourceSpec,
+    items: List[Dict[str, str]],
+    top_n: int,
+    extra_prompt: str = "",
+) -> Tuple[str, str]:
     lines = []
     for i, it in enumerate(items):
         title = clean_title(it.get("title") or "")
         lines.append(f"{i}. {title}")
     list_text = "\n".join(lines)
-    system = "你是專業財經新聞編輯，負責從候選標題中挑選最相關、最重要的新聞。"
+    system = "你是專業財經新聞編輯，負責從候選標題中挑選最相關、最重要的新聞。若提供額外指令，必須優先遵守。"
+    extra = (extra_prompt or "").strip()
+    extra_block = f"\n額外指令（最高優先，必須遵守）：{extra}\n" if extra else ""
     user = (
         f"區塊名稱：{spec.name}\n"
         f"請從下列候選標題中，挑選最符合此區塊目的的 {top_n} 則。\n"
+        f"{extra_block}"
         "只回傳 JSON 陣列（0-based index），例如：[0,2]\n"
         "候選標題：\n"
         f"{list_text}"
@@ -306,13 +304,14 @@ def gpt_pick_top_indices(
     spec: SourceSpec,
     items: List[Dict[str, str]],
     top_n: int,
+    extra_prompt: str,
     api_key: str,
     api_base: str,
     api_mode: str,
     model: str,
     timeout: int = 30,
 ) -> Tuple[List[int], Dict]:
-    dbg: Dict[str, object] = {"mode": api_mode, "model": model, "top_n": top_n}
+    dbg: Dict[str, object] = {"mode": api_mode, "model": model, "top_n": top_n, "extra_prompt": extra_prompt}
     if not api_key:
         dbg["error"] = "missing_api_key"
         return [], dbg
@@ -320,7 +319,7 @@ def gpt_pick_top_indices(
         dbg["error"] = "empty_items"
         return [], dbg
 
-    system, user = build_gpt_pick_prompt(spec, items, top_n)
+    system, user = build_gpt_pick_prompt(spec, items, top_n, extra_prompt=extra_prompt)
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -361,20 +360,62 @@ def gpt_pick_top_indices(
     return idxs, dbg
 
 
-def score_title(rule: str, title: str) -> int:
+def format_kw_text(pairs: List[Tuple[str, int]]) -> str:
+    return "\n".join([f"{pat} | {w}" for pat, w in pairs])
+
+
+def parse_kw_text(text: str, fallback: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    out: List[Tuple[str, int]] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if " | " in line:
+            pat, w = line.rsplit(" | ", 1)
+        elif "\t" in line:
+            pat, w = line.rsplit("\t", 1)
+        else:
+            pat, w = line, "1"
+        pat = (pat or "").strip()
+        if not pat:
+            continue
+        try:
+            weight = int(str(w).strip())
+        except Exception:
+            weight = 1
+        out.append((pat, weight))
+    return out if out else fallback
+
+
+def get_kw_pairs(spec: SourceSpec) -> List[Tuple[str, int]]:
+    key = f"kw_{spec.key}"
+    default_pairs = KW.get(spec.pick_rule, KW["generic"])
+    text = st.session_state.get(key, "")
+    pairs = parse_kw_text(text, default_pairs)
+    st.session_state[f"kw_pairs_{spec.key}"] = pairs
+    return pairs
+
+
+def score_title(rule: str, title: str, kw_pairs: Optional[List[Tuple[str, int]]] = None) -> int:
     title = clean_title(title or "")
     score = 0
-    for pat, w in KW.get(rule, KW["generic"]):
+    pairs = kw_pairs if kw_pairs is not None else KW.get(rule, KW["generic"])
+    for pat, w in pairs:
         if re.search(pat, title, flags=re.IGNORECASE):
             score += w
     return score
 
 
-def auto_pick_top2(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+def format_rule_keywords_from_pairs(pairs: List[Tuple[str, int]]) -> str:
+    pats = [pat for pat, _ in pairs]
+    return " / ".join(pats) if pats else "-"
+
+
+def auto_pick_top2(df: pd.DataFrame, rule: str, kw_pairs: Optional[List[Tuple[str, int]]] = None) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
-    df["score"] = df["title"].apply(lambda x: score_title(rule, x))
+    df["score"] = df["title"].apply(lambda x: score_title(rule, x, kw_pairs=kw_pairs))
     top = df.sort_values(["score", "title"], ascending=[False, True]).head(2)
     df["selected"] = False
     df.loc[top.index, "selected"] = True
@@ -824,6 +865,9 @@ def init_state():
         dbg_key = f"debug_{s.key}"
         if dbg_key not in st.session_state:
             st.session_state[dbg_key] = {}
+        kw_key = f"kw_{s.key}"
+        if kw_key not in st.session_state:
+            st.session_state[kw_key] = format_kw_text(KW.get(s.pick_rule, KW["generic"]))
 
 
 init_state()
@@ -858,8 +902,9 @@ def set_df_for_source(spec: SourceSpec, items: List[Dict[str, str]]):
     else:
         df["selected"] = df["selected"].fillna(False)
 
+    kw_pairs = get_kw_pairs(spec)
     if not df.empty:
-        df["score"] = df["title"].apply(lambda x: score_title(spec.pick_rule, x))
+        df["score"] = df["title"].apply(lambda x: score_title(spec.pick_rule, x, kw_pairs=kw_pairs))
     else:
         df["score"] = pd.Series(dtype="int")
 
@@ -868,10 +913,12 @@ def set_df_for_source(spec: SourceSpec, items: List[Dict[str, str]]):
         top_n = 2 if len(df) >= 2 else len(df)
         if use_gpt_pick and gpt_api_key:
             try:
+                extra_prompt = st.session_state.get(f"prompt_{spec.key}", "")
                 idxs, gpt_dbg = gpt_pick_top_indices(
                     spec=spec,
                     items=df[["title", "url"]].to_dict(orient="records"),
                     top_n=top_n,
+                    extra_prompt=extra_prompt,
                     api_key=gpt_api_key,
                     api_base=gpt_api_base,
                     api_mode=gpt_api_mode,
@@ -881,18 +928,48 @@ def set_df_for_source(spec: SourceSpec, items: List[Dict[str, str]]):
                     df["selected"] = False
                     df.loc[idxs, "selected"] = True
                 else:
-                    df = auto_pick_top2(df, spec.pick_rule)
+                    df = auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs)
             except Exception as e:
                 gpt_dbg = {"error": f"{type(e).__name__}: {e}"}
-                df = auto_pick_top2(df, spec.pick_rule)
+                df = auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs)
         else:
-            df = auto_pick_top2(df, spec.pick_rule)
+            df = auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs)
 
     st.session_state[spec.key] = df[["selected", "title", "url", "score"]].copy()
     if use_gpt_pick:
         st.session_state[f"gpt_{spec.key}"] = gpt_dbg
     else:
         st.session_state.pop(f"gpt_{spec.key}", None)
+
+
+def apply_pick(df: pd.DataFrame, spec: SourceSpec) -> Tuple[pd.DataFrame, Dict]:
+    if df is None or df.empty:
+        return df, {}
+    top_n = 2 if len(df) >= 2 else len(df)
+    kw_pairs = get_kw_pairs(spec)
+    if use_gpt_pick and gpt_api_key:
+        try:
+            extra_prompt = st.session_state.get(f"prompt_{spec.key}", "")
+            idxs, gpt_dbg = gpt_pick_top_indices(
+                spec=spec,
+                items=df[["title", "url"]].to_dict(orient="records"),
+                top_n=top_n,
+                extra_prompt=extra_prompt,
+                api_key=gpt_api_key,
+                api_base=gpt_api_base,
+                api_mode=gpt_api_mode,
+                model=gpt_model,
+            )
+            if idxs:
+                df = df.copy()
+                df["selected"] = False
+                df.loc[idxs, "selected"] = True
+                return df, gpt_dbg
+            return auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs), gpt_dbg
+        except Exception as e:
+            gpt_dbg = {"error": f"{type(e).__name__}: {e}"}
+            return auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs), gpt_dbg
+    return auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs), {}
 
 
 def scrape_one(spec: SourceSpec) -> Tuple[bool, str]:
@@ -927,6 +1004,31 @@ if run_all:
 
 def render_source_block(spec: SourceSpec):
     st.markdown(f"### {spec.name}")
+    pick_method = "GPT 判斷" if use_gpt_pick and gpt_api_key else "規則自動挑選"
+    st.caption(f"挑選方法：{pick_method}")
+    kw_key = f"kw_{spec.key}"
+    if kw_key not in st.session_state:
+        st.session_state[kw_key] = format_kw_text(KW.get(spec.pick_rule, KW["generic"]))
+    st.text_area(
+        "關鍵字（可編輯，每行：正則式 | 權重）",
+        key=kw_key,
+        height=120,
+        placeholder="例如：台積電|TSMC|2330 | 8",
+    )
+    kw_pairs = get_kw_pairs(spec)
+    st.caption(f"關鍵字（規則）：{format_rule_keywords_from_pairs(kw_pairs)}")
+    prompt_key = f"prompt_{spec.key}"
+    if prompt_key not in st.session_state:
+        st.session_state[prompt_key] = ""
+    st.text_area(
+        "GPT 額外挑選指令（可留空）",
+        key=prompt_key,
+        height=80,
+        help="修改後請按「重新套用 Top2」以重新挑選",
+        placeholder="例如：優先選擇含『盤後』『收盤』且有數字的標題",
+    )
+    if st.session_state.get(prompt_key, "").strip() and not (use_gpt_pick and gpt_api_key):
+        st.caption("注意：尚未啟用 GPT 判斷，此指令不會生效。")
     col1, col2, col3 = st.columns([1, 1, 3])
 
     with col1:
@@ -941,8 +1043,12 @@ def render_source_block(spec: SourceSpec):
         if st.button("重新套用 Top2", key=f"btn_pick_{spec.key}"):
             df = st.session_state[spec.key].copy()
             if not df.empty:
-                df = auto_pick_top2(df, spec.pick_rule)
+                df, gpt_dbg = apply_pick(df, spec)
                 st.session_state[spec.key] = df
+                if gpt_dbg:
+                    st.session_state[f"gpt_{spec.key}"] = gpt_dbg
+                else:
+                    st.session_state.pop(f"gpt_{spec.key}", None)
                 st.toast("已重新挑選 Top2", icon="✅")
 
     df = st.session_state[spec.key].copy()
