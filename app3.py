@@ -4,6 +4,8 @@ import json
 import time
 import os
 import html
+import smtplib
+from email.message import EmailMessage
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 
@@ -360,6 +362,50 @@ def gpt_pick_top_indices(
     return idxs, dbg
 
 
+def send_email_smtp(
+    smtp_server: str,
+    smtp_port: int,
+    use_ssl: bool,
+    sender_email: str,
+    sender_name: str,
+    app_password: str,
+    to_list: List[str],
+    subject: str,
+    body: str,
+    attachments: List[Tuple[str, bytes, str]],
+):
+    if not to_list:
+        raise ValueError("收件者清單為空")
+    if not sender_email:
+        raise ValueError("缺少寄件人信箱")
+    if not app_password:
+        raise ValueError("缺少寄件人密碼（App Password）")
+
+    msg = EmailMessage()
+    msg["From"] = f"{sender_name} <{sender_email}>" if sender_name else sender_email
+    msg["To"] = ", ".join(to_list)
+    msg["Subject"] = subject or "新聞匯出"
+    msg.set_content(body or "請參閱附件。")
+
+    for fname, data, mime in attachments:
+        if "/" in mime:
+            maintype, subtype = mime.split("/", 1)
+        else:
+            maintype, subtype = "application", "octet-stream"
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=fname)
+
+    if use_ssl:
+        with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30) as s:
+            s.login(sender_email, app_password)
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(sender_email, app_password)
+            s.send_message(msg)
+
+
 def format_kw_text(pairs: List[Tuple[str, int]]) -> str:
     return "\n".join([f"{pat} | {w}" for pat, w in pairs])
 
@@ -411,14 +457,137 @@ def format_rule_keywords_from_pairs(pairs: List[Tuple[str, int]]) -> str:
     return " / ".join(pats) if pats else "-"
 
 
+def count_unique_candidates(df: pd.DataFrame) -> int:
+    if df is None or df.empty:
+        return 0
+    seen_title = set()
+    seen_url = set()
+    count = 0
+    for _, row in df.iterrows():
+        title = clean_title(row.get("title") or "").lower()
+        url = (row.get("url") or "").strip().lower()
+        dup_title = title and title in seen_title
+        dup_url = url and url in seen_url
+        if dup_title or dup_url:
+            continue
+        if title:
+            seen_title.add(title)
+        if url:
+            seen_url.add(url)
+        count += 1
+    return count
+
+
+def pick_unique_indices(df: pd.DataFrame, order: List[int], max_n: int) -> List[int]:
+    picked = []
+    seen_title = set()
+    seen_url = set()
+    for idx in order:
+        title = clean_title(df.at[idx, "title"] or "").lower()
+        url = (df.at[idx, "url"] or "").strip().lower()
+        dup_title = title and title in seen_title
+        dup_url = url and url in seen_url
+        if dup_title or dup_url:
+            continue
+        picked.append(idx)
+        if title:
+            seen_title.add(title)
+        if url:
+            seen_url.add(url)
+        if len(picked) >= max_n:
+            break
+    return picked
+
+
+def enforce_two_unique(
+    df: pd.DataFrame,
+    rule: str,
+    kw_pairs: Optional[List[Tuple[str, int]]] = None,
+    prefer_selected: bool = False,
+) -> Tuple[pd.DataFrame, int]:
+    if df is None or df.empty:
+        return df, 0
+    df = df.copy()
+    df["score"] = df["title"].apply(lambda x: score_title(rule, x, kw_pairs=kw_pairs))
+
+    unique_count = count_unique_candidates(df)
+    max_pick = 2 if unique_count >= 2 else unique_count
+
+    if prefer_selected:
+        selected_idxs = [i for i, r in df.iterrows() if bool(r.get("selected"))]
+        remaining = [i for i in df.index if i not in set(selected_idxs)]
+        remaining_sorted = sorted(
+            remaining,
+            key=lambda i: (-df.at[i, "score"], clean_title(df.at[i, "title"] or "")),
+        )
+        order = selected_idxs + remaining_sorted
+    else:
+        order = sorted(
+            df.index,
+            key=lambda i: (-df.at[i, "score"], clean_title(df.at[i, "title"] or "")),
+        )
+
+    picked = pick_unique_indices(df, order, max_pick)
+    df["selected"] = False
+    df.loc[picked, "selected"] = True
+    return df, unique_count
+
+
+def enforce_global_unique_across_categories(specs: List[SourceSpec]) -> Dict[str, List[Dict[str, object]]]:
+    removed: List[Dict[str, object]] = []
+    shortages: List[Dict[str, object]] = []
+    seen_title = set()
+    seen_url = set()
+
+    for spec in specs:
+        df = st.session_state.get(spec.key)
+        if df is None or df.empty:
+            continue
+        df = df.copy()
+        df["selected"] = df["selected"].fillna(False).astype(bool)
+        kw_pairs = get_kw_pairs(spec)
+        df["score"] = df["title"].apply(lambda x: score_title(spec.pick_rule, x, kw_pairs=kw_pairs))
+
+        selected_idxs = [i for i, r in df.iterrows() if bool(r.get("selected"))]
+        remaining = [i for i in df.index if i not in set(selected_idxs)]
+        remaining_sorted = sorted(
+            remaining,
+            key=lambda i: (-df.at[i, "score"], clean_title(df.at[i, "title"] or "")),
+        )
+        order = selected_idxs + remaining_sorted
+
+        picked = []
+        for idx in order:
+            title = clean_title(df.at[idx, "title"] or "").lower()
+            url = (df.at[idx, "url"] or "").strip().lower()
+            if (title and title in seen_title) or (url and url in seen_url):
+                if idx in selected_idxs:
+                    removed.append(
+                        {"source": spec.name, "title": df.at[idx, "title"], "url": df.at[idx, "url"]}
+                    )
+                continue
+            if title:
+                seen_title.add(title)
+            if url:
+                seen_url.add(url)
+            picked.append(idx)
+            if len(picked) >= 2:
+                break
+
+        df["selected"] = False
+        df.loc[picked, "selected"] = True
+        st.session_state[spec.key] = df
+
+        if len(picked) < 2:
+            shortages.append({"source": spec.name, "picked": len(picked)})
+
+    return {"removed": removed, "shortages": shortages}
+
+
 def auto_pick_top2(df: pd.DataFrame, rule: str, kw_pairs: Optional[List[Tuple[str, int]]] = None) -> pd.DataFrame:
     if df.empty:
         return df
-    df = df.copy()
-    df["score"] = df["title"].apply(lambda x: score_title(rule, x, kw_pairs=kw_pairs))
-    top = df.sort_values(["score", "title"], ascending=[False, True]).head(2)
-    df["selected"] = False
-    df.loc[top.index, "selected"] = True
+    df, _ = enforce_two_unique(df, rule, kw_pairs=kw_pairs, prefer_selected=False)
     return df
 
 
@@ -876,6 +1045,7 @@ with st.sidebar:
     st.subheader("控制面板")
     secret = st.text_input("（選用）鉅亨 OPEN API secret", value="", type="password")
     export_fmt = st.selectbox("匯出格式", ["CSV", "XLSX", "JSON"], index=0)
+    mail_to = st.text_input("郵件收件者（逗號分隔）", value="leesungan@yuanta.com")
     enable_autopick = st.toggle("抓取後自動挑選 Top 2（每區塊）", value=True)
     use_gpt_pick = st.toggle("使用 GPT 判斷 Top2", value=False)
     gpt_api_key = st.text_input("GPT API Key", value=DEFAULT_GPT_KEY, type="password")
@@ -886,6 +1056,13 @@ with st.sidebar:
     show_debug = st.toggle("顯示 Debug 面板", value=True)
     if use_gpt_pick and not gpt_api_key:
         st.warning("已啟用 GPT 判斷，但未填 API Key。將改用規則自動挑選。")
+    with st.expander("郵件設定", expanded=False):
+        smtp_server = st.text_input("SMTP 伺服器", value="smtp.gmail.com")
+        smtp_port = st.number_input("SMTP 連接埠", min_value=1, max_value=65535, value=587, step=1)
+        use_ssl = st.toggle("使用 SSL（465）", value=False)
+        sender_email = st.text_input("寄件人信箱", value="a77689466@gmail.com")
+        sender_name = st.text_input("寄件人名稱", value="Alex")
+        app_password = st.text_input("寄件人密碼（App Password）", value="", type="password")
     st.divider()
     run_all = st.button("一鍵：全部抓取", type="primary")
 
@@ -901,6 +1078,7 @@ def set_df_for_source(spec: SourceSpec, items: List[Dict[str, str]]):
         df.insert(0, "selected", False)
     else:
         df["selected"] = df["selected"].fillna(False)
+    df["selected"] = df["selected"].astype(bool)
 
     kw_pairs = get_kw_pairs(spec)
     if not df.empty:
@@ -935,6 +1113,13 @@ def set_df_for_source(spec: SourceSpec, items: List[Dict[str, str]]):
         else:
             df = auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs)
 
+    df, unique_count = enforce_two_unique(
+        df,
+        spec.pick_rule,
+        kw_pairs=kw_pairs,
+        prefer_selected=bool(use_gpt_pick and gpt_api_key),
+    )
+    st.session_state[f"unique_count_{spec.key}"] = unique_count
     st.session_state[spec.key] = df[["selected", "title", "url", "score"]].copy()
     if use_gpt_pick:
         st.session_state[f"gpt_{spec.key}"] = gpt_dbg
@@ -964,12 +1149,19 @@ def apply_pick(df: pd.DataFrame, spec: SourceSpec) -> Tuple[pd.DataFrame, Dict]:
                 df = df.copy()
                 df["selected"] = False
                 df.loc[idxs, "selected"] = True
+                df, _ = enforce_two_unique(df, spec.pick_rule, kw_pairs=kw_pairs, prefer_selected=True)
                 return df, gpt_dbg
-            return auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs), gpt_dbg
+            df = auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs)
+            df, _ = enforce_two_unique(df, spec.pick_rule, kw_pairs=kw_pairs, prefer_selected=True)
+            return df, gpt_dbg
         except Exception as e:
             gpt_dbg = {"error": f"{type(e).__name__}: {e}"}
-            return auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs), gpt_dbg
-    return auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs), {}
+            df = auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs)
+            df, _ = enforce_two_unique(df, spec.pick_rule, kw_pairs=kw_pairs, prefer_selected=True)
+            return df, gpt_dbg
+    df = auto_pick_top2(df, spec.pick_rule, kw_pairs=kw_pairs)
+    df, _ = enforce_two_unique(df, spec.pick_rule, kw_pairs=kw_pairs, prefer_selected=True)
+    return df, {}
 
 
 def scrape_one(spec: SourceSpec) -> Tuple[bool, str]:
@@ -1017,6 +1209,7 @@ def render_source_block(spec: SourceSpec):
     )
     kw_pairs = get_kw_pairs(spec)
     st.caption(f"關鍵字（規則）：{format_rule_keywords_from_pairs(kw_pairs)}")
+    st.caption("同一類別內與跨類別皆會自動取消重複標題或 URL 的勾選")
     prompt_key = f"prompt_{spec.key}"
     if prompt_key not in st.session_state:
         st.session_state[prompt_key] = ""
@@ -1062,6 +1255,9 @@ def render_source_block(spec: SourceSpec):
         st.divider()
         return
 
+    df["selected"] = df["selected"].fillna(False).astype(bool)
+    df = df.reset_index(drop=True)
+
     edited = st.data_editor(
         df,
         key=f"editor_{spec.key}",
@@ -1074,10 +1270,21 @@ def render_source_block(spec: SourceSpec):
             "score": st.column_config.NumberColumn("score", help="自動打分用（可忽略）"),
         },
     )
+    edited["selected"] = edited["selected"].fillna(False).astype(bool)
+    edited, unique_count = enforce_two_unique(
+        edited,
+        spec.pick_rule,
+        kw_pairs=kw_pairs,
+        prefer_selected=True,
+    )
+    st.session_state[f"unique_count_{spec.key}"] = unique_count
     st.session_state[spec.key] = edited
 
     picked = edited[edited["selected"] == True][["title", "url"]].copy()
-    st.caption(f"已選：{len(picked)} 則")
+    st.caption(f"已選：{len(picked)} 則（每類固定 2 則，不可重複）")
+    unique_count = st.session_state.get(f"unique_count_{spec.key}", 0)
+    if unique_count < 2:
+        st.warning("此類別候選不足 2 則不同新聞，已選為目前可用的最大數。")
 
     if show_debug:
         dbg = st.session_state.get(f"debug_{spec.key}", {})
@@ -1112,6 +1319,14 @@ for spec in SOURCES_UI:
 # -----------------------------
 st.subheader("最終匯出清單（彙總所有 selected）")
 
+global_dedup = enforce_global_unique_across_categories(SOURCES_UI)
+if global_dedup["removed"]:
+    st.warning("已自動移除跨類別重複新聞（保留先出現的類別）。")
+    st.dataframe(pd.DataFrame(global_dedup["removed"]), use_container_width=True)
+if global_dedup["shortages"]:
+    st.warning("部分類別因跨類別去重後不足 2 則，已選為目前可用的最大數。")
+    st.dataframe(pd.DataFrame(global_dedup["shortages"]), use_container_width=True)
+
 final_rows = []
 for spec in SOURCES_UI:
     df = st.session_state[spec.key]
@@ -1122,13 +1337,39 @@ for spec in SOURCES_UI:
         t = clean_title(r["title"] or "")
         u = (r["url"] or "").strip()
         if t and u:
-            final_rows.append({"title": t, "url": u})
+            final_rows.append({"title": t, "url": u, "source": spec.name})
 
-final_df = pd.DataFrame(final_rows)
-if final_df.empty:
+final_df_all = pd.DataFrame(final_rows)
+if final_df_all.empty:
     st.info("目前尚無 selected 項目。請先抓取並勾選。")
 else:
+    check_df = final_df_all.copy()
+    check_df["title_norm"] = check_df["title"].apply(clean_title).str.lower()
+    check_df["url_norm"] = check_df["url"].str.strip().str.lower()
+    dup_url_mask = check_df["url_norm"].ne("") & check_df["url_norm"].duplicated(keep=False)
+    dup_title_mask = check_df["title_norm"].ne("") & check_df["title_norm"].duplicated(keep=False)
+    dup_mask = dup_url_mask | dup_title_mask
+    if dup_mask.any():
+        st.warning("偵測到跨類別重複新聞（依 URL 或標題）。請調整各類別選取。")
+        dup_rows = check_df.loc[dup_mask, ["source", "title", "url"]].copy()
+        def _reason(row):
+            reasons = []
+            if row.name in check_df.index and dup_url_mask.loc[row.name]:
+                reasons.append("URL")
+            if row.name in check_df.index and dup_title_mask.loc[row.name]:
+                reasons.append("標題")
+            return "/".join(reasons)
+        dup_rows["重複原因"] = dup_rows.apply(_reason, axis=1)
+        st.dataframe(dup_rows, use_container_width=True)
+
+    final_df = final_df_all[["title", "url"]].copy()
     final_df = final_df.drop_duplicates(subset=["url"], keep="first").reset_index(drop=True)
+    mail_to_value = (mail_to or "").strip()
+    if mail_to_value:
+        final_df = pd.concat(
+            [final_df, pd.DataFrame([{"title": "郵件收件者", "url": mail_to_value}])],
+            ignore_index=True,
+        )
     final_df = st.data_editor(
         final_df,
         key="final_editor",
@@ -1172,6 +1413,31 @@ else:
         mime=mime,
         type="primary",
     )
+
+    st.divider()
+    st.subheader("寄送郵件")
+    default_subject = f"新聞匯出 {time.strftime('%Y-%m-%d')}"
+    mail_subject = st.text_input("信件主旨", value=default_subject)
+    mail_body = st.text_area("信件內容", value="請參閱附件。", height=120)
+    send_disabled = not mail_to_value
+    if st.button("寄送郵件", type="primary", disabled=send_disabled):
+        try:
+            to_list = [x.strip() for x in (mail_to_value or "").split(",") if x.strip()]
+            send_email_smtp(
+                smtp_server=smtp_server,
+                smtp_port=int(smtp_port),
+                use_ssl=use_ssl,
+                sender_email=sender_email,
+                sender_name=sender_name,
+                app_password=app_password,
+                to_list=to_list,
+                subject=mail_subject,
+                body=mail_body,
+                attachments=[(fname, data, mime)],
+            )
+            st.success("已寄出。")
+        except Exception as e:
+            st.error(f"寄送失敗：{type(e).__name__}: {e}")
 
 st.caption(
     "提醒：UDN 分區 DOM 可能讓 stop heading 先出現，最新版已對「最新文章」改用 stop_tag 的 previous links 取值，避免 items=0。鉅亨搜尋頁仍可能前端渲染，本版已加多重 fallback。"
